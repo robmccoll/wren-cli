@@ -73,6 +73,11 @@ typedef enum
   TOKEN_GTGT,
   TOKEN_PIPE,
   TOKEN_PIPEPIPE,
+  TOKEN_PIPEDOT,
+  TOKEN_PIPECOLON,
+  TOKEN_PIPEQUESTION,
+  TOKEN_PIPEGT,
+  TOKEN_PIPEDOLLAR,
   TOKEN_CARET,
   TOKEN_AMP,
   TOKEN_AMPAMP,
@@ -173,6 +178,9 @@ typedef struct
 
   // The 1-based line number of [currentChar].
   int currentLine;
+
+  // Whether or not the current scope supports the $ temporary variable
+  int inDollarScope;
 
   // The upcoming token.
   Token next;
@@ -623,9 +631,10 @@ static Keyword keywords[] =
 };
 
 // Returns true if [c] is a valid (non-initial) identifier character.
-static bool isName(char c)
+static bool isName(Parser* parser, char c)
 {
-  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+  if((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') return true;
+  return c == '$' && parser->inDollarScope;
 }
 
 // Returns true if [c] is a digit.
@@ -820,7 +829,7 @@ static void readName(Parser* parser, TokenType type, char firstChar)
   wrenByteBufferInit(&string);
   wrenByteBufferWrite(parser->vm, &string, firstChar);
 
-  while (isName(peekChar(parser)) || isDigit(peekChar(parser)))
+  while (isName(parser, peekChar(parser)) || isDigit(peekChar(parser)))
   {
     char c = nextChar(parser);
     wrenByteBufferWrite(parser->vm, &string, c);
@@ -1108,7 +1117,32 @@ static void nextToken(Parser* parser)
       case '~': makeToken(parser, TOKEN_TILDE); return;
       case '?': makeToken(parser, TOKEN_QUESTION); return;
         
-      case '|': twoCharToken(parser, '|', TOKEN_PIPEPIPE, TOKEN_PIPE); return;
+      case '|': 
+        if (matchChar(parser, '|'))
+        {
+          makeToken(parser, TOKEN_PIPEPIPE);
+        }
+        else if(matchChar(parser, '.'))
+        {
+          makeToken(parser, TOKEN_PIPEDOT);
+        }
+        else if(matchChar(parser, ':'))
+        {
+          makeToken(parser, TOKEN_PIPECOLON);
+        }
+        else if(matchChar(parser, '>'))
+        {
+          makeToken(parser, TOKEN_PIPEGT);
+        }
+        else if(matchChar(parser, '$'))
+        {
+          makeToken(parser, TOKEN_PIPEDOLLAR);
+        }
+        else
+        {
+          twoCharToken(parser, '?', TOKEN_PIPEQUESTION, TOKEN_PIPE);
+        }
+        return;
       case '&': twoCharToken(parser, '&', TOKEN_AMPAMP, TOKEN_AMP); return;
       case '=': twoCharToken(parser, '=', TOKEN_EQEQ, TOKEN_EQ); return;
       case '!': twoCharToken(parser, '=', TOKEN_BANGEQ, TOKEN_BANG); return;
@@ -1200,7 +1234,7 @@ static void nextToken(Parser* parser)
         return;
 
       default:
-        if (isName(c))
+        if (isName(parser, c))
         {
           readName(parser, TOKEN_NAME, c);
         }
@@ -1724,6 +1758,7 @@ typedef enum
   PREC_FACTOR,        // * / %
   PREC_UNARY,         // unary - ! ~
   PREC_CALL,          // . () []
+  PREC_PIPE,          // |: |? |>
   PREC_PRIMARY
 } Precedence;
 
@@ -1746,6 +1781,7 @@ static void expression(Compiler* compiler);
 static void statement(Compiler* compiler);
 static void definition(Compiler* compiler);
 static void parsePrecedence(Compiler* compiler, Precedence precedence);
+static void parseMaxPrecedence(Compiler* compiler, Precedence precedence, Precedence maxPrecedence);
 
 // Replaces the placeholder argument for a previous CODE_JUMP or CODE_JUMP_IF
 // instruction with an offset that jumps to the current end of bytecode.
@@ -2131,7 +2167,7 @@ static void loadCoreVariable(Compiler* compiler, const char* name)
   emitShortArg(compiler, CODE_LOAD_MODULE_VAR, symbol);
 }
 
-// A parenthesized expression.
+// A parenthesized expression
 static void grouping(Compiler* compiler, bool canAssign)
 {
   expression(compiler);
@@ -2164,8 +2200,27 @@ static void list(Compiler* compiler, bool canAssign)
 }
 
 // A map literal.
-static void map(Compiler* compiler, bool canAssign)
+static void mapOrFn(Compiler* compiler, bool canAssign)
 {
+  if (match(compiler, TOKEN_PIPE))
+  {
+    Compiler fnCompiler;
+    initCompiler(&fnCompiler, compiler->parser, compiler, false);
+
+    // Make a dummy signature to track the arity.
+    Signature fnSignature = { "", 0, SIG_METHOD, 0 };
+
+    finishParameterList(&fnCompiler, &fnSignature);
+    consume(compiler, TOKEN_PIPE, "Expect '|' after function parameters.");
+
+    fnCompiler.fn->arity = fnSignature.arity;
+
+    finishBody(&fnCompiler);
+
+    endCompiler(&fnCompiler, "inlineFunc", 10);
+    return;
+  }
+
   // Instantiate a new map.
   loadCoreVariable(compiler, "Map");
   callMethod(compiler, 0, "new()", 5);
@@ -2404,8 +2459,26 @@ static void name(Compiler* compiler, bool canAssign)
       error(compiler, "Too many module variables defined.");
     }
   }
-  
+
   bareName(compiler, canAssign, variable);
+
+  if (peek(compiler) == TOKEN_LEFT_PAREN) {
+
+    consume(compiler, TOKEN_LEFT_PAREN, "");
+    Signature called = { "call", 4, SIG_METHOD, 0 };
+
+    // Allow new line before an empty argument list
+    ignoreNewlines(compiler);
+
+    // Allow empty an argument list.
+    if (peek(compiler) != TOKEN_RIGHT_PAREN)
+    {
+      finishArgumentList(compiler, &called);
+    }
+    consume(compiler, TOKEN_RIGHT_PAREN, "Expect ')' after arguments.");
+
+    callSignature(compiler, CODE_CALL_0, &called);
+  }
 }
 
 static void null(Compiler* compiler, bool canAssign)
@@ -2547,6 +2620,122 @@ static void or_(Compiler* compiler, bool canAssign)
   int jump = emitJump(compiler, CODE_OR);
   parsePrecedence(compiler, PREC_LOGICAL_OR);
   patchJump(compiler, jump);
+}
+
+// Parses a comma-separated list of arguments. Modifies [signature] to include
+// the arity of the argument list. Stops parsing at next pipe call.
+static void finishPipeArgumentList(Compiler* compiler, Signature* signature)
+{
+  do
+  {
+    ignoreNewlines(compiler);
+    validateNumParameters(compiler, ++signature->arity);
+    parseMaxPrecedence(compiler, PREC_LOWEST, PREC_PIPE);
+  }
+  while (match(compiler, TOKEN_COMMA));
+
+  // Allow a newline before the closing delimiter.
+  ignoreNewlines(compiler);
+}
+
+static void callPipe(Compiler* compiler, bool canAssign, Signature* called) {
+  // Parse the argument list, if any.
+  if (match(compiler, TOKEN_LEFT_PAREN))
+  {
+    // Allow new line before an empty argument list
+    ignoreNewlines(compiler);
+
+    // Allow empty an argument list.
+    if (peek(compiler) != TOKEN_RIGHT_PAREN)
+    {
+      finishArgumentList(compiler, called);
+    }
+    consume(compiler, TOKEN_RIGHT_PAREN, "Expect ')' after arguments.");
+  }
+
+  // Parse the block argument, if any.
+  else if (match(compiler, TOKEN_LEFT_BRACE))
+  {
+    called->arity++;
+    Compiler fnCompiler;
+    initCompiler(&fnCompiler, compiler->parser, compiler, false);
+
+    // Make a dummy signature to track the arity.
+    Signature fnSignature = { "", 0, SIG_METHOD, 0 };
+
+    // Parse the parameter list, if any.
+    if (match(compiler, TOKEN_PIPE))
+    {
+      finishParameterList(&fnCompiler, &fnSignature);
+      consume(compiler, TOKEN_PIPE, "Expect '|' after function parameters.");
+    }
+
+    fnCompiler.fn->arity = fnSignature.arity;
+
+    finishBody(&fnCompiler);
+
+    // Name the function based on the method its passed to.
+    char blockName[MAX_METHOD_SIGNATURE + 15];
+    int blockLength;
+    signatureToString(called, blockName, &blockLength);
+    memmove(blockName + blockLength, " block argument", 16);
+
+    endCompiler(&fnCompiler, blockName, blockLength + 15);
+  }
+
+  else {
+    finishPipeArgumentList(compiler, called);
+  }
+
+  callSignature(compiler, CODE_CALL_0, called);
+}
+
+static void callMap(Compiler* compiler, bool canAssign)
+{
+  // Make a new signature that contains the updated arity and type based on
+  // the arguments we find.
+  Signature called = { "map", 3, SIG_METHOD, 0 };
+  callPipe(compiler, canAssign, &called);
+}
+
+static void callWhere(Compiler* compiler, bool canAssign)
+{
+  // Make a new signature that contains the updated arity and type based on
+  // the arguments we find.
+  Signature called = { "where", 5, SIG_METHOD, 0 };
+  callPipe(compiler, canAssign, &called);
+}
+
+static void callReduce(Compiler* compiler, bool canAssign)
+{
+  // Make a new signature that contains the updated arity and type based on
+  // the arguments we find.
+  Signature called = { "reduce", 6, SIG_METHOD, 0 };
+  callPipe(compiler, canAssign, &called);
+}
+
+static void callPipeDollar(Compiler* compiler, bool canAssign)
+{
+  Compiler fnCompiler;
+  initCompiler(&fnCompiler, compiler->parser, compiler, false);
+
+  // Make a dummy signature to track the arity.
+  Signature fnSignature = { "", 0, SIG_METHOD, 1 };
+
+  Token dollar = {TOKEN_NAME, "$", 1, -1, 0};
+  declareVariable(compiler, &dollar);
+
+  fnCompiler.parser->inDollarScope++;
+  if (peek(compiler) == TOKEN_LEFT_BRACE) {
+    consume(compiler, TOKEN_LEFT_BRACE, "");
+    finishBody(&fnCompiler);
+  } else {
+    expression(&fnCompiler);
+    emitOp(compiler, CODE_RETURN);
+  }
+  fnCompiler.parser->inDollarScope--;
+
+  callSignature(compiler, CODE_CALL_0, &fnSignature);
 }
 
 static void conditional(Compiler* compiler, bool canAssign)
@@ -2748,7 +2937,7 @@ GrammarRule rules[] =
   /* TOKEN_RIGHT_PAREN   */ UNUSED,
   /* TOKEN_LEFT_BRACKET  */ { list, subscript, subscriptSignature, PREC_CALL, NULL },
   /* TOKEN_RIGHT_BRACKET */ UNUSED,
-  /* TOKEN_LEFT_BRACE    */ PREFIX(map),
+  /* TOKEN_LEFT_BRACE    */ PREFIX(mapOrFn),
   /* TOKEN_RIGHT_BRACE   */ UNUSED,
   /* TOKEN_COLON         */ UNUSED,
   /* TOKEN_DOT           */ INFIX(PREC_CALL, call),
@@ -2765,6 +2954,11 @@ GrammarRule rules[] =
   /* TOKEN_GTGT          */ INFIX_OPERATOR(PREC_BITWISE_SHIFT, ">>"),
   /* TOKEN_PIPE          */ INFIX_OPERATOR(PREC_BITWISE_OR, "|"),
   /* TOKEN_PIPEPIPE      */ INFIX(PREC_LOGICAL_OR, or_),
+  /* TOKEN_PIPEDOT       */ INFIX(PREC_PIPE, call),
+  /* TOKEN_PIPECOLON     */ INFIX(PREC_PIPE, callMap),
+  /* TOKEN_PIPEQUESTION  */ INFIX(PREC_PIPE, callWhere),
+  /* TOKEN_PIPEGT        */ INFIX(PREC_PIPE, callReduce),
+  /* TOKEN_PIPEDOLLAR    */ INFIX(PREC_PIPE, callPipeDollar),
   /* TOKEN_CARET         */ INFIX_OPERATOR(PREC_BITWISE_XOR, "^"),
   /* TOKEN_AMP           */ INFIX_OPERATOR(PREC_BITWISE_AND, "&"),
   /* TOKEN_AMPAMP        */ INFIX(PREC_LOGICAL_AND, and_),
@@ -2843,6 +3037,38 @@ void parsePrecedence(Compiler* compiler, Precedence precedence)
     nextToken(compiler->parser);
     GrammarFn infix = rules[compiler->parser->previous.type].infix;
     infix(compiler, canAssign);
+  }
+}
+
+// The main entrypoint for the top-down operator precedence parser.
+void parseMaxPrecedence(Compiler* compiler, Precedence precedence, Precedence maxPrecedence)
+{
+  nextToken(compiler->parser);
+  GrammarFn prefix = rules[compiler->parser->previous.type].prefix;
+
+  if (prefix == NULL)
+  {
+    error(compiler, "Expected expression.");
+    return;
+  }
+
+  // Track if the precendence of the surrounding expression is low enough to
+  // allow an assignment inside this one. We can't compile an assignment like
+  // a normal expression because it requires us to handle the LHS specially --
+  // it needs to be an lvalue, not an rvalue. So, for each of the kinds of
+  // expressions that are valid lvalues -- names, subscripts, fields, etc. --
+  // we pass in whether or not it appears in a context loose enough to allow
+  // "=". If so, it will parse the "=" itself and handle it appropriately.
+  bool canAssign = precedence <= PREC_CONDITIONAL;
+  prefix(compiler, canAssign);
+
+  Precedence curPrecedence = rules[compiler->parser->current.type].precedence;
+  while (precedence <= curPrecedence && curPrecedence < maxPrecedence)
+  {
+    nextToken(compiler->parser);
+    GrammarFn infix = rules[compiler->parser->previous.type].infix;
+    infix(compiler, canAssign);
+    curPrecedence = rules[compiler->parser->current.type].precedence;
   }
 }
 
